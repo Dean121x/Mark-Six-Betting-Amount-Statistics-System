@@ -1,6 +1,7 @@
 import re
 import json
 import os
+import sys
 import shutil
 import threading
 import time
@@ -44,6 +45,14 @@ ZODIAC_COLORS = {"鼠": "#3b82f6", "牛": "#3b82f6", "虎": "#3b82f6",
                   "猴": "#22c55e", "鸡": "#22c55e", "狗": "#22c55e", "猪": "#22c55e"}
 WAVE_COLORS = {"蓝": "#3b82f6", "红": "#ef4444", "绿": "#22c55e"}
 ZODIAC_SET = {"鼠", "牛", "虎", "兔", "龙", "蛇", "马", "羊", "猴", "鸡", "狗", "猪"}
+WAVE_NUMBERS = {
+    "红": {1, 2, 7, 8, 12, 13, 18, 19, 23, 24, 29, 30, 34, 35, 40, 45},
+    "蓝": {3, 4, 9, 10, 14, 15, 20, 25, 26, 31, 36, 37, 41, 46, 47, 48},
+    "绿": {5, 6, 11, 16, 17, 21, 22, 27, 28, 32, 33, 38, 39, 42, 43, 44, 49},
+}
+WAVE_SET = {"红波", "蓝波", "绿波"}
+ZODIAC_NAMES_RE = "鼠|牛|虎|兔|龙|蛇|马|羊|猴|鸡|狗|猪"
+WAVE_NAMES_RE = "红波|蓝波|绿波"
 
 
 # ─── Editable Treeview ────────────────────────────────────────────────────────
@@ -171,15 +180,16 @@ class LotteryStatsApp:
             "狗": [9, 21, 33, 45],
             "猪": [8, 20, 32, 44],
         }
-        zodiac_wave = {
-            "鼠":"蓝","牛":"蓝","虎":"蓝",
-            "兔":"红","龙":"红","蛇":"红","马":"红","羊":"红",
-            "猴":"绿","鸡":"绿","狗":"绿","猪":"绿",
-        }
         m = {}
         for zodiac, nums in zodiac_nums.items():
-            wave = zodiac_wave[zodiac]
             for n in nums:
+                # Number-based wave color (not zodiac-based)
+                if n in WAVE_NUMBERS["红"]:
+                    wave = "红"
+                elif n in WAVE_NUMBERS["蓝"]:
+                    wave = "蓝"
+                else:
+                    wave = "绿"
                 m[str(n)] = {"生肖": zodiac, "波色": wave}
         # Sort by number
         return {str(k): m[str(k)] for k in sorted(m, key=int)}
@@ -445,30 +455,60 @@ class LotteryStatsApp:
         self._update_status(f"解析完成 — 识别到 {len(parsed)} 个号码")
 
     def _parse_text_content(self, text):
-        # Normalize separators: Chinese/English commas, whitespace → uniform dots + spaces
-        text = text.replace("，", ".").replace(",", ".").replace("、", ".")
-        # Convert Chinese number words to digits (longer compounds first)
+        # ── Pre-processing ──
+        text = text.replace("米", "元")           # Slang
+        text = text.replace("斤", "元")           # Slang
+        text = text.replace("澳", "")            # Ignore 澳 prefix
+        text = text.replace("各号", "各")          # "各号" = "各"
+        # Convert Chinese number words
         cn_nums = [("九十", "90"), ("八十", "80"), ("七十", "70"), ("六十", "60"),
                    ("五十", "50"), ("四十", "40"), ("三十", "30"), ("二十", "20"),
                    ("十", "10"), ("九", "9"), ("八", "8"), ("七", "7"), ("六", "6"),
                    ("五", "5"), ("四", "4"), ("三", "3"), ("二", "2"), ("一", "1")]
         for cn, digit in cn_nums:
             text = text.replace(cn, digit)
-        # Remove "元" suffix (but keep "万"/"亿" for amount parsing)
         text = text.replace("元", "")
+        # Expand ranges: "01至20" → dot-separated numbers
+        text = re.sub(r'(\d+)至(\d+)',
+                      lambda m: ".".join(str(i) for i in range(
+                          int(m.group(1)), int(m.group(2)) + 1)), text)
+        # Normalize separators (not "/" — that's for number/amount pairs)
+        for sep in ['，', ',', '、', '%', '-', '+', '*', '_']:
+            text = text.replace(sep, '.')
+
         result = {}
         groups = re.split(r'\s+', text.strip())
         for group in groups:
             if not group:
                 continue
-            if "各" in group:
+            # Detect number/amount pairs: "06/10" pattern
+            if '/' in group and '各' not in group:
+                self._parse_slash_format(group, result)
+            elif '各' in group:
                 self._parse_ge_format(group, result)
             else:
-                self._parse_zodiac_total_format(group, result)
+                self._parse_zodiac_or_wave_total_format(group, result)
         return result
 
+    # ── / pair format ──────────────────────────────────────────────────────────
+    def _parse_slash_format(self, group, result):
+        """Parse 'num/amount' pairs like 06/10 or 18/80."""
+        # Strip leading non-digit prefix (e.g. 澳06/10 → 06/10)
+        group = re.sub(r'^[^\d]+', '', group)
+        for token in re.split(r'\s+', group):
+            if '/' not in token:
+                continue
+            parts = token.split('/')
+            if len(parts) >= 2:
+                num = self._resolve_part(parts[0])
+                amt_str = re.match(r'(\d+)', parts[1])
+                if num and amt_str:
+                    amount = int(amt_str.group(1))
+                    result[num] = result.get(num, 0) + amount
+
+    # ── 各 format ───────────────────────────────────────────────────────────────
     def _parse_ge_format(self, group, result):
-        """Parse 'X各Y' format: items separated by dots, each gets the amount."""
+        """Parse 'X各Y' format."""
         segs = group.split("各")
         for i in range(len(segs) - 1):
             items_str = segs[i].rstrip(".")
@@ -484,12 +524,22 @@ class LotteryStatsApp:
                 amount *= 10000
             elif suffix == "亿":
                 amount *= 100000000
-            for part in items_str.split("."):
+            # Split items by "." — handle non-separated zodiacs by splitting
+            # consecutive CJK chars into individual zodiac names
+            parts = self._split_items(items_str)
+            for part in parts:
                 if not part:
                     continue
-                # Zodiac name → total amount split across its numbers
                 if part in ZODIAC_SET:
                     nums = self._get_numbers_for_zodiac(part)
+                    if nums:
+                        base = amount // len(nums)
+                        rem = amount % len(nums)
+                        for idx, num in enumerate(nums):
+                            share = base + (1 if idx < rem else 0)
+                            result[num] = result.get(num, 0) + share
+                elif part in WAVE_SET:
+                    nums = self._get_numbers_for_wave(part)
                     if nums:
                         base = amount // len(nums)
                         rem = amount % len(nums)
@@ -501,33 +551,93 @@ class LotteryStatsApp:
                     if num:
                         result[num] = result.get(num, 0) + amount
 
-    def _parse_zodiac_total_format(self, group, result):
-        """Parse '平?生肖金额' format: total amount split across zodiac's numbers."""
-        zodiac_names = "鼠|牛|虎|兔|龙|蛇|马|羊|猴|鸡|狗|猪"
-        pattern = rf'(?:平|特)?({zodiac_names})(\d+)(万|亿)?'
+    def _split_items(self, items_str):
+        """Split items by '.' AND also split consecutive Chinese zodiac names."""
+        raw_parts = items_str.split(".")
+        result = []
+        for p in raw_parts:
+            if not p:
+                continue
+            # Split consecutive zodiac/wave names: "虎蛇鼠" → ["虎","蛇","鼠"]
+            # Also "红波蓝波" → ["红波","蓝波"]
+            sub = self._split_cn_names(p)
+            result.extend(sub)
+        return result
+
+    def _split_cn_names(self, s):
+        """Split a string of consecutive Chinese zodiac/wave names into individuals."""
+        # Try to match zodiac names (single char) or wave names (two chars: X波)
+        parts = []
+        i = 0
+        while i < len(s):
+            matched = False
+            # Check for wave name (2 chars)
+            if i + 1 < len(s) and s[i:i+2] in WAVE_SET:
+                parts.append(s[i:i+2])
+                i += 2
+                matched = True
+            elif s[i] in ZODIAC_SET:
+                parts.append(s[i])
+                i += 1
+                matched = True
+            else:
+                # Not a recognized name — accumulate until we hit one
+                j = i
+                while j < len(s) and s[j] not in ZODIAC_SET:
+                    if j + 1 < len(s) and s[j:j+2] in WAVE_SET:
+                        break
+                    j += 1
+                if j > i:
+                    parts.append(s[i:j])
+                    i = j
+                else:
+                    # Try to match wave
+                    if i + 1 < len(s) and s[i:i+2] in WAVE_SET:
+                        parts.append(s[i:i+2])
+                        i += 2
+                    else:
+                        parts.append(s[i])
+                        i += 1
+        return parts
+
+    # ── Zodiac / Wave total format (no 各) ──────────────────────────────────────
+    def _parse_zodiac_or_wave_total_format(self, group, result):
+        """Parse '平?生肖金额' or '平?波色金额' format."""
+        pattern = rf'(?:平|特)?({ZODIAC_NAMES_RE}|{WAVE_NAMES_RE})(\d+)(万|亿)?'
         for match in re.findall(pattern, group):
-            zodiac = match[0]
+            name = match[0]
             amount = int(match[1])
             suffix = match[2] if len(match) > 2 else None
             if suffix == "万":
                 amount *= 10000
             elif suffix == "亿":
                 amount *= 100000000
-            nums = self._get_numbers_for_zodiac(zodiac)
+            if name in ZODIAC_SET:
+                nums = self._get_numbers_for_zodiac(name)
+            else:
+                nums = self._get_numbers_for_wave(name)
             if not nums:
                 continue
-            # Split amount evenly, remainder goes to first numbers
             base = amount // len(nums)
             rem = amount % len(nums)
             for idx, num in enumerate(nums):
                 share = base + (1 if idx < rem else 0)
                 result[num] = result.get(num, 0) + share
 
+    # ── Lookup helpers ──────────────────────────────────────────────────────────
     def _get_numbers_for_zodiac(self, zodiac):
-        """Return sorted list of number strings for a given zodiac."""
         nums = []
         for num, info in self.config["生肖映射"].items():
             if info["生肖"] == zodiac:
+                nums.append(num)
+        return sorted(nums, key=int)
+
+    def _get_numbers_for_wave(self, wave_name):
+        """Get all number strings for a wave color name ('红波'/'蓝波'/'绿波')."""
+        color = wave_name[0]  # First char = 红/蓝/绿
+        nums = []
+        for num, info in self.config["生肖映射"].items():
+            if info["波色"] == color:
                 nums.append(num)
         return sorted(nums, key=int)
 
