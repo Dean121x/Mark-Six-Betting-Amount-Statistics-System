@@ -1,0 +1,8 @@
+__pycache__/
+backup/
+excel/
+dist/
+build/
+*.spec
+~$*.xlsx
+.claude/
