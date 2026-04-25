@@ -6,3 +6,4 @@ build/
 *.spec
 ~$*.xlsx
 .claude/
+统计表.xlsx
