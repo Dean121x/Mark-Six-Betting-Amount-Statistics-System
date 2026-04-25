@@ -53,6 +53,22 @@ WAVE_NUMBERS = {
 WAVE_SET = {"红波", "蓝波", "绿波"}
 ZODIAC_NAMES_RE = "鼠|牛|虎|兔|龙|蛇|马|羊|猴|鸡|狗|猪"
 WAVE_NAMES_RE = "红波|蓝波|绿波"
+PROP_NAMES_RE = "大单|大双|小单|小双|单数|双数|大|小|单|双"
+# Number property sets (1-49)
+_ODD = set(range(1, 50, 2))
+_EVEN = set(range(2, 50, 2))
+_BIG = set(range(25, 50))
+_SMALL = set(range(1, 25))
+PROP_NUMBERS = {
+    "单": _ODD, "单数": _ODD,
+    "双": _EVEN, "双数": _EVEN,
+    "大": _BIG, "小": _SMALL,
+    "大单": _BIG & _ODD, "大双": _BIG & _EVEN,
+    "小单": _SMALL & _ODD, "小双": _SMALL & _EVEN,
+}
+PROP_SET = set(PROP_NUMBERS.keys())
+# Fuzzy zodiac: common typos → correct name
+FUZZY_ZODIAC = {"免": "兔", "鬼": "兔", "龟": "兔"}
 
 
 # ─── Editable Treeview ────────────────────────────────────────────────────────
@@ -455,11 +471,19 @@ class LotteryStatsApp:
         self._update_status(f"解析完成 — 识别到 {len(parsed)} 个号码")
 
     def _parse_text_content(self, text):
-        # ── Pre-processing ──
-        text = text.replace("米", "元")           # Slang
-        text = text.replace("斤", "元")           # Slang
-        text = text.replace("澳", "")            # Ignore 澳 prefix
-        text = text.replace("各号", "各")          # "各号" = "各"
+        # ── Pre-processing (order matters) ──
+        # Slang: money units
+        for s in ["米", "斤", "井"]:
+            text = text.replace(s, "元")
+        # Slang: "各" equivalents
+        for s in ["各号", "一个数", "下"]:
+            text = text.replace(s, "各")
+        text = text.replace("澳", "")            # Ignore prefix
+        text = text.replace("#", "")             # Noise char
+        # Fuzzy zodiac correction (before CN conversion to avoid conflicts)
+        for wrong, correct in FUZZY_ZODIAC.items():
+            if wrong != correct:  # Only real typos, skip identity mappings
+                text = text.replace(wrong, correct)
         # Convert Chinese number words
         cn_nums = [("九十", "90"), ("八十", "80"), ("七十", "70"), ("六十", "60"),
                    ("五十", "50"), ("四十", "40"), ("三十", "30"), ("二十", "20"),
@@ -468,12 +492,12 @@ class LotteryStatsApp:
         for cn, digit in cn_nums:
             text = text.replace(cn, digit)
         text = text.replace("元", "")
-        # Expand ranges: "01至20" → dot-separated numbers
-        text = re.sub(r'(\d+)至(\d+)',
-                      lambda m: ".".join(str(i) for i in range(
-                          int(m.group(1)), int(m.group(2)) + 1)), text)
+        # Expand ranges: "01至20", "01-49" → dot-separated numbers
+        for pat in [r'(\d+)至(\d+)', r'(\d+)-(\d+)']:
+            text = re.sub(pat, lambda m: ".".join(
+                str(i) for i in range(int(m.group(1)), int(m.group(2)) + 1)), text)
         # Normalize separators (not "/" — that's for number/amount pairs)
-        for sep in ['，', ',', '、', '%', '-', '+', '*', '_']:
+        for sep in ['，', ',', '、', '%', '+', '*', '_']:
             text = text.replace(sep, '.')
 
         result = {}
@@ -515,6 +539,8 @@ class LotteryStatsApp:
             amount_str = segs[i + 1]
             if not items_str:
                 continue
+            # Strip leading noise from amount (e.g. "/300" → "300")
+            amount_str = re.sub(r'^[^\d]+', '', amount_str)
             amt_match = re.match(r'(\d+)(万|亿)?', amount_str)
             if not amt_match:
                 continue
@@ -524,32 +550,31 @@ class LotteryStatsApp:
                 amount *= 10000
             elif suffix == "亿":
                 amount *= 100000000
-            # Split items by "." — handle non-separated zodiacs by splitting
-            # consecutive CJK chars into individual zodiac names
             parts = self._split_items(items_str)
             for part in parts:
                 if not part:
                     continue
-                if part in ZODIAC_SET:
-                    nums = self._get_numbers_for_zodiac(part)
-                    if nums:
-                        base = amount // len(nums)
-                        rem = amount % len(nums)
-                        for idx, num in enumerate(nums):
-                            share = base + (1 if idx < rem else 0)
-                            result[num] = result.get(num, 0) + share
-                elif part in WAVE_SET:
-                    nums = self._get_numbers_for_wave(part)
-                    if nums:
-                        base = amount // len(nums)
-                        rem = amount % len(nums)
-                        for idx, num in enumerate(nums):
-                            share = base + (1 if idx < rem else 0)
-                            result[num] = result.get(num, 0) + share
+                nums = self._expand_keyword(part)
+                if nums is not None:
+                    base = amount // len(nums)
+                    rem = amount % len(nums)
+                    for idx, num in enumerate(nums):
+                        share = base + (1 if idx < rem else 0)
+                        result[num] = result.get(num, 0) + share
                 else:
                     num = self._resolve_part(part)
                     if num:
                         result[num] = result.get(num, 0) + amount
+
+    def _expand_keyword(self, keyword):
+        """Expand zodiac/wave/prop keyword to list of number strings, or None."""
+        if keyword in ZODIAC_SET:
+            return self._get_numbers_for_zodiac(keyword)
+        if keyword in WAVE_SET:
+            return self._get_numbers_for_wave(keyword)
+        if keyword in PROP_SET:
+            return self._get_numbers_for_prop(keyword)
+        return None
 
     def _split_items(self, items_str):
         """Split items by '.' AND also split consecutive Chinese zodiac names."""
@@ -570,40 +595,40 @@ class LotteryStatsApp:
         parts = []
         i = 0
         while i < len(s):
+            # Check multi-char keywords first (大单/大双/小单/小双/单数/双数/红波/蓝波/绿波)
             matched = False
-            # Check for wave name (2 chars)
-            if i + 1 < len(s) and s[i:i+2] in WAVE_SET:
-                parts.append(s[i:i+2])
-                i += 2
-                matched = True
-            elif s[i] in ZODIAC_SET:
+            for length in [2]:  # 2-char keywords
+                if i + length <= len(s) and s[i:i+length] in (WAVE_SET | PROP_SET):
+                    parts.append(s[i:i+length])
+                    i += length
+                    matched = True
+                    break
+            if matched:
+                continue
+            if s[i] in ZODIAC_SET:
                 parts.append(s[i])
                 i += 1
-                matched = True
+                continue
+            # Not a keyword start — accumulate non-keyword chars
+            j = i
+            while j < len(s):
+                if s[j] in ZODIAC_SET:
+                    break
+                if j + 1 < len(s) and s[j:j+2] in (WAVE_SET | PROP_SET):
+                    break
+                j += 1
+            if j > i:
+                parts.append(s[i:j])
+                i = j
             else:
-                # Not a recognized name — accumulate until we hit one
-                j = i
-                while j < len(s) and s[j] not in ZODIAC_SET:
-                    if j + 1 < len(s) and s[j:j+2] in WAVE_SET:
-                        break
-                    j += 1
-                if j > i:
-                    parts.append(s[i:j])
-                    i = j
-                else:
-                    # Try to match wave
-                    if i + 1 < len(s) and s[i:i+2] in WAVE_SET:
-                        parts.append(s[i:i+2])
-                        i += 2
-                    else:
-                        parts.append(s[i])
-                        i += 1
+                parts.append(s[i])
+                i += 1
         return parts
 
-    # ── Zodiac / Wave total format (no 各) ──────────────────────────────────────
+    # ── Zodiac / Wave / Prop total format (no 各) ───────────────────────────────
     def _parse_zodiac_or_wave_total_format(self, group, result):
-        """Parse '平?生肖金额' or '平?波色金额' format."""
-        pattern = rf'(?:平|特)?({ZODIAC_NAMES_RE}|{WAVE_NAMES_RE})(\d+)(万|亿)?'
+        """Parse '平?生肖金额' or '平?波色金额' or property total format."""
+        pattern = rf'(?:平|特)?({ZODIAC_NAMES_RE}|{WAVE_NAMES_RE}|{PROP_NAMES_RE})(\d+)(万|亿)?'
         for match in re.findall(pattern, group):
             name = match[0]
             amount = int(match[1])
@@ -612,10 +637,7 @@ class LotteryStatsApp:
                 amount *= 10000
             elif suffix == "亿":
                 amount *= 100000000
-            if name in ZODIAC_SET:
-                nums = self._get_numbers_for_zodiac(name)
-            else:
-                nums = self._get_numbers_for_wave(name)
+            nums = self._expand_keyword(name)
             if not nums:
                 continue
             base = amount // len(nums)
@@ -634,12 +656,18 @@ class LotteryStatsApp:
 
     def _get_numbers_for_wave(self, wave_name):
         """Get all number strings for a wave color name ('红波'/'蓝波'/'绿波')."""
-        color = wave_name[0]  # First char = 红/蓝/绿
+        color = wave_name[0]
         nums = []
         for num, info in self.config["生肖映射"].items():
             if info["波色"] == color:
                 nums.append(num)
         return sorted(nums, key=int)
+
+    def _get_numbers_for_prop(self, prop):
+        """Get all number strings for a property keyword (单/双/大/小 etc.)."""
+        if prop not in PROP_NUMBERS:
+            return []
+        return sorted([str(n) for n in PROP_NUMBERS[prop] if 1 <= n <= 49], key=int)
 
     def _resolve_part(self, part):
         if part.lstrip("0").isdigit() and 1 <= int(part) <= 49:
